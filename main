@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""
+Unified Multi-Device Data Collection System
+
+This script coordinates data collection from available device collector classes
+in /collectors. It now acts only as an orchestrator (no duplicated device
+logic) assembling threads for any enabled devices and writing to a shared CSV.
+
+Usage:
+    python unified_collect.py --output "combined.csv" --duration 5 --tmicro --tmicro-port COM9 --tsi --tsi-port COM14 --scope --psu --psu-port COM13
+
+Author: Justin McDonald
+Date: August 19, 2025
+Version: 1.0
+"""
+
+import sys
+import os
+import time
+import threading
+import argparse
+import signal
+from typing import List, Dict
+
+# Path adjustments
+script_dir = os.path.dirname(os.path.abspath(__file__))
+collectors_dir = os.path.join(script_dir, 'collectors')
+sys.path.insert(0, collectors_dir)
+
+# Shared constants / helpers
+from collectors.common import build_headers
+
+# Reuse existing csv writer (thread-safe and process-safe) for unified mode
+from collectors.csv_file_writer import get_csv_writer
+
+# Import collector classes (standalone scripts define them). We import modules then pull classes.
+from collectors.tmicro_collector import TMicroCollector
+from collectors.agilent_collector import AgilentCollector
+from collectors.hans_collector import HansCollector
+from collectors.tsi_collector import TSICollector
+from collectors.p6000_collector import P6000Collector
+
+# Factory mapping for simpler instantiation & potential future dynamic extension
+COLLECTOR_FACTORY = {
+    'tmicro': lambda args, duration, scope_channels=None: TMicroCollector(args.tmicro_port or 'auto', args.output, duration, args.tmicro_interval, args.tmicro_flow),
+    'agilent': lambda args, duration, scope_channels: AgilentCollector(scope_channels, args.output, duration, args.scope_resource, args.scope_interval, _parse_vdiv(args.scope_vdiv, scope_channels), _parse_acquisition_mode(args.scope_acquisition_mode), args.scope_vernier),
+    'hans': lambda args, duration, scope_channels=None: HansCollector(args.hans_port or 'COM8', args.output, duration, args.hans_interval),
+    'tsi': lambda args, duration, scope_channels=None: TSICollector(args.tsi_port or 'COM14', args.output, duration, args.tsi_interval),
+    'p6000': lambda args, duration, scope_channels=None: P6000Collector(args.psu_port or 'COM13', args.output, duration, args.psu_interval, args.psu_output_mode)
+}
+
+def _parse_vdiv(vdiv_str: str, channels: List[int]) -> Dict[int, float]:
+    if not vdiv_str:
+        return {}
+    vdiv_map: Dict[int, float] = {}
+    try:
+        if ':' in vdiv_str:
+            parts = [p.strip() for p in vdiv_str.split(',') if p.strip()]
+            for part in parts:
+                ch_s, val_s = part.split(':', 1)
+                vdiv_map[int(ch_s)] = float(val_s)
+        else:
+            val = float(vdiv_str)
+            for ch in channels:
+                vdiv_map[ch] = val
+    except Exception as e:
+        print(f"[Unified] Warning: could not parse scope vdiv '{vdiv_str}': {e}")
+    return vdiv_map
+
+def _parse_acquisition_mode(mode_args: List[str]) -> Dict[str, any]:
+    """Parse acquisition mode arguments into a dict for the collector."""
+    if not mode_args:
+        return {}
+    
+    mode_dict = {}
+    if len(mode_args) == 1:
+        mode = mode_args[0].lower()
+        if mode in ['normal', 'highres']:
+            mode_dict['mode'] = mode
+        elif mode == 'averaging':
+            mode_dict['mode'] = 'averaging'
+            mode_dict['count'] = 2  # Default count
+        else:
+            print(f"[Unified] Warning: unknown acquisition mode '{mode}'")
+    elif len(mode_args) == 2 and mode_args[0].lower() == 'averaging':
+        try:
+            count = int(mode_args[1])
+            mode_dict['mode'] = 'averaging'
+            mode_dict['count'] = count
+        except ValueError:
+            print(f"[Unified] Warning: invalid averaging count '{mode_args[1]}'")
+    else:
+        print(f"[Unified] Warning: invalid acquisition mode arguments: {mode_args}")
+    
+    return mode_dict
+
+class ThreadWrapper:
+    """Wrap a standalone collector instance providing start/stop for unified orchestration."""
+    def __init__(self, name: str, target_instance, stop_event: threading.Event):
+        self.name = name
+        self.instance = target_instance
+        self.stop_event = stop_event
+        self.thread: threading.Thread | None = None
+    def start(self) -> bool:
+        self.thread = threading.Thread(target=self.instance.collect_data, name=f"{self.name}-Thread", daemon=True)
+        self.thread.start()
+        return True
+    def stop(self):
+        if hasattr(self.instance, 'stop'):
+            try:
+                self.instance.stop()
+            except Exception:
+                pass
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully."""
+    print("\nShutdown signal received. Stopping data collection...")
+    stop_event.set()
+
+
+def parse_duration(duration_str: str) -> float:
+    """Parse duration string (e.g., '5s', '2m', '1h') to seconds."""
+    if duration_str.endswith('s'):
+        return float(duration_str[:-1])
+    elif duration_str.endswith('m'):
+        return float(duration_str[:-1]) * 60
+    elif duration_str.endswith('h'):
+        return float(duration_str[:-1]) * 3600
+    else:
+        return float(duration_str)  # Assume seconds
+
+
+def main():
+    global stop_event
+    
+    parser = argparse.ArgumentParser(description='Unified Multi-Device Data Collection System')
+    
+    # Global options
+    parser.add_argument('--output', '-o', type=str, default='combined_data.csv',
+                        help='Output CSV filename (default: combined_data.csv)')
+    parser.add_argument('--duration', '-d', type=str, default='60s',
+                        help='Collection duration (e.g., 5s, 2m, 1h, default: 60s)')
+    
+    # Device enable flags
+    parser.add_argument('--tmicro', action='store_true', help='Enable TMicro CPAP device')
+    parser.add_argument('--scope', action='store_true', help='Enable Agilent oscilloscope')
+    parser.add_argument('--hans', action='store_true', help='Enable Hans Rudolph breathing simulator')
+    parser.add_argument('--tsi', action='store_true', help='Enable TSI flowmeter')
+    parser.add_argument('--psu', action='store_true', help='Enable P6000 power supply')
+    
+    # Device-specific options
+    parser.add_argument('--tmicro-port', type=str, help='TMicro COM port (auto-detect if not specified)')
+    parser.add_argument('--tmicro-interval', type=float, default=0.1, help='TMicro sampling interval seconds (default 0.1)')
+    parser.add_argument('--tmicro-flow', action='store_true', help='Include TMicro flow measurements (default: off)')
+    parser.add_argument('--scope-resource', type=str, help='Agilent VISA resource string')
+    parser.add_argument('--scope-channels', type=str, default='1,2,3,4', help='Oscilloscope channels (default: 1,2,3,4)')
+    parser.add_argument('--scope-interval', type=float, default=0.1, help='Agilent sampling interval seconds (default 0.1)')
+    parser.add_argument('--scope-vdiv', type=str, help='Oscilloscope volts/div: single value (e.g. 0.5) or per-channel mapping (e.g. 1:0.2,2:0.5)')
+    parser.add_argument('--scope-acquisition-mode', type=str, nargs='*', help='Acquisition mode: "normal", "highres", or "averaging <count>" (e.g. "averaging 8")')
+    parser.add_argument('--scope-vernier', action='store_true', help='Enable vernier/fine adjustment mode')
+    parser.add_argument('--hans-port', type=str, help='Hans Rudolph COM port (default: COM8)')
+    parser.add_argument('--hans-interval', type=float, default=0.1, help='Hans sampling interval seconds (default 0.1)')
+    parser.add_argument('--tsi-port', type=str, help='TSI flowmeter COM port (default: COM14)')
+    parser.add_argument('--tsi-interval', type=float, default=0.1, help='TSI sampling interval seconds (default 0.1)')
+    parser.add_argument('--psu-port', type=str, help='P6000 power supply COM port (default: COM13)')
+    parser.add_argument('--psu-interval', type=float, default=0.1, help='P6000 sampling interval seconds (default 0.1)')
+    parser.add_argument('--psu-output-mode', type=str, default='on', choices=['on','off','onoff','offon'], help='P6000 output behavior: on, off, onoff, offon')
+    
+    args = parser.parse_args()
+    
+    # Parse duration
+    try:
+        duration_seconds = parse_duration(args.duration)
+    except ValueError:
+        print(f"Invalid duration format: {args.duration}")
+        sys.exit(1)
+    
+    # Parse scope channels
+    scope_channels = [int(x.strip()) for x in args.scope_channels.split(',')]
+    
+    # Create unified CSV headers via common builder
+    headers = build_headers({'tmicro': args.tmicro, 'agilent': args.scope, 'hans': args.hans, 'tsi': args.tsi, 'p6000': args.psu}, scope_channels, args.tmicro_flow)
+    
+    if not any([args.tmicro, args.scope, args.hans, args.tsi, args.psu]):
+        print("Error: At least one device must be enabled.")
+        print("Use --tmicro, --scope, --hans, --tsi, or --psu flags.")
+        sys.exit(1)
+    
+    # Create CSV writer (will initialize file with full headers if new)
+    csv_writer = get_csv_writer(args.output, 'unified', headers=headers)
+    
+    # Create stop event
+    stop_event = threading.Event()
+    
+    # Setup signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Create device collectors using factory map
+    collectors = []
+    if args.tmicro:
+        collectors.append(ThreadWrapper('TMicro', COLLECTOR_FACTORY['tmicro'](args, duration_seconds), stop_event))
+    if args.scope:
+        collectors.append(ThreadWrapper('Agilent', COLLECTOR_FACTORY['agilent'](args, duration_seconds, scope_channels), stop_event))
+    if args.hans:
+        collectors.append(ThreadWrapper('Hans', COLLECTOR_FACTORY['hans'](args, duration_seconds), stop_event))
+    if args.tsi:
+        collectors.append(ThreadWrapper('TSI', COLLECTOR_FACTORY['tsi'](args, duration_seconds), stop_event))
+    if args.psu:
+        collectors.append(ThreadWrapper('P6000', COLLECTOR_FACTORY['p6000'](args, duration_seconds), stop_event))
+    
+    print(f"Starting unified data collection for {duration_seconds:.1f} seconds")
+    print(f"Output file: {args.output}")
+    print(f"Enabled devices: {len(collectors)}")
+    print("-" * 60)
+    
+    # Start all collectors
+    active_collectors = []
+    for collector in collectors:
+        if collector.start():
+            active_collectors.append(collector)
+    
+    if not active_collectors:
+        print("Error: No devices connected successfully.")
+        sys.exit(1)
+    
+    print(f"Data collection started with {len(active_collectors)} devices")
+    print("Press Ctrl+C to stop early")
+    
+    # Wait for duration or stop signal
+    start_time = time.time()
+    try:
+        while not stop_event.is_set():
+            elapsed = time.time() - start_time
+            if elapsed >= duration_seconds:
+                break
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    
+    # Stop all collectors
+    print("\nStopping data collection...")
+    stop_event.set()
+    
+    for collector in active_collectors:
+        try:
+            collector.stop()
+        except Exception:
+            pass
+    
+    elapsed = time.time() - start_time
+    print(f"Data collection completed in {elapsed:.1f} seconds")
+    print(f"Data saved to: {args.output}")
+    # Cleanup leftover lock file
+    try:
+        lock_file = args.output + ".lock"
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+            print(f"[unified] Removed lock file: {lock_file}")
+    except Exception as e:
+        print(f"[unified] Warning: could not remove lock file {lock_file}: {e}")
+
+
+if __name__ == '__main__':
+    main()
