@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+Unified Automation Testing Interface
+
+This script acts as a central launcher for various device-specific
+command-line interface (CLI) testing scripts. It provides a simple
+menu to execute the dedicated CLI for each piece of hardware.
+
+This approach delegates all device-specific logic to the individual
+scripts, making this launcher a lightweight and maintainable entry point.
+
+Author: Justin McDonald
+Date: August 11, 2025
+Version: 2.1
+Status: Active Development
+"""
+
+import sys
+import os
+import subprocess
+import time
+
+class UnifiedTestInterfaceLauncher:
+    """
+    A launcher for various automation testing CLI scripts.
+    """
+    
+    def __init__(self):
+        """Initialize the launcher and locate the CLI scripts."""
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.is_compiled = getattr(sys, 'frozen', False)  # True if running as compiled executable
+        
+        self.cli_scripts = {
+            "hans": os.path.join(self.base_dir, 'Hans', 'python scripts', 'hans_cli.py'),
+            "flowmeter": os.path.join(self.base_dir, 'Flowmeter', 'python scripts', 'tsi_cli.py'),
+            "powersupply": os.path.join(self.base_dir, 'PowerSupply', 'python scripts', 'p6000_cli.py'),
+            "oscilloscope": os.path.join(self.base_dir, 'Scope', 'python scripts', 'agilent_cli.py'),
+            "tmicro": os.path.join(self.base_dir, 'TMicro Scripts', 'python scripts', 'CLI', 'SerialCpapComm_cli.py'),
+        }
+        
+        print("=== Unified Automation Testing Interface ===")
+        if self.is_compiled:
+            print("Running as compiled executable")
+        else:
+            print("Running in development mode")
+        self._verify_scripts()
+
+    def _verify_scripts(self):
+        """Verify that all target CLI scripts exist."""
+        print("Verifying CLI script paths...")
+        all_found = True
+        for name, path in self.cli_scripts.items():
+            if not self.is_compiled and not os.path.exists(path):
+                print(f"  [!] WARNING: {name.capitalize()} CLI not found at: {path}")
+                all_found = False
+            elif not self.is_compiled:
+                print(f"  [✓] {name.capitalize()} CLI found.")
+            else:
+                print(f"  [✓] {name.capitalize()} CLI will be loaded from compiled bundle.")
+        if not all_found and not self.is_compiled:
+            print("\nSome scripts were not found. The corresponding menu options may fail.")
+
+    def display_main_menu(self):
+        """Display the main launcher menu."""
+        print("\n" + "="*60)
+        print(" UNIFIED AUTOMATION TESTING INTERFACE")
+        print("="*60)
+        print("\n--- Select a device CLI to launch ---")
+        print("1. Hans Rudolph Breathing Simulator (hans_cli.py)")
+        print("2. TSI Flowmeter (tsi_cli.py)")
+        print("3. P6000 Power Supply (p6000_cli.py)")
+        print("4. Agilent Oscilloscope (agilent_cli.py)")
+        print("5. TMicro CPAP Device (SerialCpapComm_cli.py)")
+        print("\n0. Exit")
+        print("\nNote: All CLI interfaces use standardized commands:")
+        print("- Type '0' to exit any CLI")
+        print("- Type 'help' or 'h' to show menus")
+        print("="*60)
+
+    def launch_cli(self, script_path: str, device_name: str):
+        """
+        Launches a CLI script either as a separate process (development) or directly imports and runs it (compiled).
+        
+        Args:
+            script_path (str): The absolute path to the Python script to execute.
+            device_name (str): The name of the device for identification.
+        """
+        if self.is_compiled:
+            # Running as compiled executable - import and run the modules directly
+            self._run_compiled_cli(device_name)
+        else:
+            # Running in development mode - launch as separate process
+            self._run_development_cli(script_path)
+
+    def _run_compiled_cli(self, device_name: str):
+        """Run CLI directly by importing modules when compiled."""
+        print(f"\nLaunching {device_name} CLI (compiled mode)...")
+        
+        try:
+            if device_name == "hans":
+                self._run_hans_cli()
+            elif device_name == "flowmeter":
+                self._run_tsi_cli()
+            elif device_name == "powersupply":
+                self._run_p6000_cli()
+            elif device_name == "oscilloscope":
+                self._run_agilent_cli()
+            elif device_name == "tmicro":
+                self._run_tmicro_cli()
+            else:
+                print(f"Unknown device: {device_name}")
+                
+        except ImportError as e:
+            print(f"\nError: Could not import {device_name} module: {e}")
+            print("Please ensure all required modules are included in the compiled executable.")
+            input("Press Enter to continue...")
+        except Exception as e:
+            print(f"\nError running {device_name} CLI: {e}")
+            input("Press Enter to continue...")
+
+    def _run_development_cli(self, script_path: str):
+        """Run CLI as separate process in development mode."""
+        if not os.path.exists(script_path):
+            print(f"\nError: Script not found at '{script_path}'")
+            input("Press Enter to continue...")
+            return
+
+        print(f"\nLaunching '{os.path.basename(script_path)}' in a new window...")
+        
+        try:
+            # For Windows, 'start' command can be used to open a new command prompt
+            # that runs the specified command. This is non-blocking.
+            python_executable = sys.executable
+            command = f'start "Launching {os.path.basename(script_path)}" "{python_executable}" "{script_path}"'
+            subprocess.Popen(command, shell=True)
+            print("Launch command sent. A new window should appear shortly.")
+        except Exception as e:
+            print(f"\nAn error occurred while trying to launch the script: {e}")
+            print("Please ensure you are on a Windows system for this launch method to work.")
+            input("Press Enter to continue...")
+
+    def _run_hans_cli(self):
+        """Run Hans CLI directly."""
+        try:
+            # Add the Hans scripts directory to path
+            if self.is_compiled:
+                # In compiled mode, add the bundled path
+                hans_scripts_dir = os.path.join(sys._MEIPASS, 'Hans', 'python scripts') if hasattr(sys, '_MEIPASS') else os.path.join(self.base_dir, 'Hans', 'python scripts')
+            else:
+                hans_scripts_dir = os.path.join(self.base_dir, 'Hans', 'python scripts')
+            
+            if hans_scripts_dir not in sys.path:
+                sys.path.insert(0, hans_scripts_dir)
+            
+            from hans_cli import main
+            main()
+        except Exception as e:
+            print(f"Error running Hans CLI: {e}")
+            input("Press Enter to continue...")
+
+    def _run_tsi_cli(self):
+        """Run TSI CLI directly."""
+        try:
+            # Add the Flowmeter scripts directory to path
+            if self.is_compiled:
+                tsi_scripts_dir = os.path.join(sys._MEIPASS, 'Flowmeter', 'python scripts') if hasattr(sys, '_MEIPASS') else os.path.join(self.base_dir, 'Flowmeter', 'python scripts')
+            else:
+                tsi_scripts_dir = os.path.join(self.base_dir, 'Flowmeter', 'python scripts')
+            
+            if tsi_scripts_dir not in sys.path:
+                sys.path.insert(0, tsi_scripts_dir)
+            
+            from tsi_cli import main
+            main()
+        except Exception as e:
+            print(f"Error running TSI CLI: {e}")
+            input("Press Enter to continue...")
+
+    def _run_p6000_cli(self):
+        """Run P6000 CLI directly."""
+        try:
+            # Add the PowerSupply scripts directory to path
+            if self.is_compiled:
+                p6000_scripts_dir = os.path.join(sys._MEIPASS, 'PowerSupply', 'python scripts') if hasattr(sys, '_MEIPASS') else os.path.join(self.base_dir, 'PowerSupply', 'python scripts')
+            else:
+                p6000_scripts_dir = os.path.join(self.base_dir, 'PowerSupply', 'python scripts')
+            
+            if p6000_scripts_dir not in sys.path:
+                sys.path.insert(0, p6000_scripts_dir)
+            
+            from p6000_cli import main
+            main()
+        except Exception as e:
+            print(f"Error running P6000 CLI: {e}")
+            input("Press Enter to continue...")
+
+    def _run_agilent_cli(self):
+        """Run Agilent CLI directly."""
+        try:
+            # Add the Scope scripts directory to path
+            if self.is_compiled:
+                agilent_scripts_dir = os.path.join(sys._MEIPASS, 'Scope', 'python scripts') if hasattr(sys, '_MEIPASS') else os.path.join(self.base_dir, 'Scope', 'python scripts')
+            else:
+                agilent_scripts_dir = os.path.join(self.base_dir, 'Scope', 'python scripts')
+            
+            if agilent_scripts_dir not in sys.path:
+                sys.path.insert(0, agilent_scripts_dir)
+            
+            from agilent_cli import main
+            main()
+        except Exception as e:
+            print(f"Error running Agilent CLI: {e}")
+            input("Press Enter to continue...")
+
+    def _run_tmicro_cli(self):
+        """Run TMicro CLI directly."""
+        try:
+            # Add the TMicro scripts directory to path
+            if self.is_compiled:
+                tmicro_scripts_dir = os.path.join(sys._MEIPASS, 'TMicro Scripts', 'python scripts') if hasattr(sys, '_MEIPASS') else os.path.join(self.base_dir, 'TMicro Scripts', 'python scripts')
+            else:
+                tmicro_scripts_dir = os.path.join(self.base_dir, 'TMicro Scripts', 'python scripts')
+            
+            if tmicro_scripts_dir not in sys.path:
+                sys.path.insert(0, tmicro_scripts_dir)
+            
+            # Import and run the getRPMAndPressure main function
+            from getRPMAndPressure import main
+            main()
+        except Exception as e:
+            print(f"Error running TMicro CLI: {e}")
+            input("Press Enter to continue...")
+
+    def run(self):
+        """Main loop to display menu and handle user choices."""
+        while True:
+            self.display_main_menu()
+            choice = input("Enter your choice (0-5): ")
+
+            if choice == '1':
+                self.launch_cli(self.cli_scripts['hans'], 'hans')
+            elif choice == '2':
+                self.launch_cli(self.cli_scripts['flowmeter'], 'flowmeter')
+            elif choice == '3':
+                self.launch_cli(self.cli_scripts['powersupply'], 'powersupply')
+            elif choice == '4':
+                self.launch_cli(self.cli_scripts['oscilloscope'], 'oscilloscope')
+            elif choice == '5':
+                self.launch_cli(self.cli_scripts['tmicro'], 'tmicro')
+            elif choice == '0':
+                print("Exiting Unified Test Interface Launcher.")
+                break
+            else:
+                print("Invalid choice. Please try again.")
+            
+            print("\nReturning to the main launcher menu...")
+            time.sleep(1) # Brief pause before re-displaying menu
+
+if __name__ == '__main__':
+    launcher = UnifiedTestInterfaceLauncher()
+    launcher.run()
